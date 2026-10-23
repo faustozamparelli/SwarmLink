@@ -1,0 +1,46 @@
+{
+  "config": {
+    "seeds": [
+      11,
+      29,
+      47,
+      71,
+      101,
+      131,
+      173,
+      211
+    ],
+    "trials_per_seed": 125,
+    "drone_counts": [
+      3,
+      5,
+      8
+    ],
+    "communication_ranges": [
+      200.0,
+      350.0,
+      500.0
+    ],
+    "width": 1000.0,
+    "height": 1000.0,
+    "station": [
+      500.0,
+      100.0
+    ],
+    "rms_radius": 100.0,
+    "noise_std_deg": 2.0,
+    "max_condition": 1000000.0,
+    "bootstrap_samples": 2000
+  },
+  "config_sha256": "38319591ff14fd1be14c31e816810b0de0455bcac8ec8d6e6232418fd0d097e7",
+  "reference_distance_m": 1414.213562373095,
+  "placement_margin_m": 264.5751311064591,
+  "versions": {
+    "python": "3.14.8",
+    "numpy": "2.5.4",
+    "matplotlib": "3.11.2"
+  },
+  "random_generator": "PCG64 + SeedSequence([seed, trial, stream])",
+  "uncertainty": "95% percentile bootstrap of paired scenario IDs; all N/range settings stay in each block",
+  "scene_case_id": "s11-t0000-n8-r500"
+}

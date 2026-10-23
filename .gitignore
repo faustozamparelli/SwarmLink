@@ -1,1 +1,9 @@
-*.md
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+# Large reproducible trial logs remain available locally.
+results/**/trials.csv
+results/**/drones.csv
+*.tmp
+*~
