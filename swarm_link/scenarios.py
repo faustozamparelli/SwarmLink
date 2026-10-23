@@ -88,8 +88,8 @@ class Scenario:
     noise_rad: np.ndarray
 
 
-def rng_for(seed, trial, stream):
-    return np.random.Generator(np.random.PCG64(np.random.SeedSequence([seed, trial, stream])))
+def rng_for(seed, trial, stream, *substreams):
+    return np.random.Generator(np.random.PCG64(np.random.SeedSequence([seed, trial, stream, *substreams])))
 
 
 def make_scenario(config, seed, trial):

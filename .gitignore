@@ -5,5 +5,9 @@ __pycache__/
 # Large reproducible trial logs remain available locally.
 results/**/trials.csv
 results/**/drones.csv
+results/sequential/**/episodes.csv
+results/sequential/**/steps.csv
+results/sequential/**/drone_steps.csv
+results/sequential/**/drone_episodes.csv
 *.tmp
 *~

@@ -6,3 +6,8 @@
 - Document reproducible commands and generated outputs in README. Report failures and limitations honestly; never present planned work as implemented or omit failed cases from evaluation.
 - Write focused tests for important behavior and failure cases. Run the relevant checks and inspect generated plots or other visual artifacts.
 - Use Context7 for current library/framework/SDK/API/CLI/cloud documentation: resolve the library ID first, then query the relevant docs. Prefer official documentation as fallback if unavailable. General programming and business-logic work do not require a lookup.
+
+# Tools
+
+- Python: use `uv sync --locked` and `uv run --locked`; dependencies live in `pyproject.toml` / `uv.lock`. Avoid bare `pip`.
+- Version control: use `jj` exclusively, including `jj git` for remote operations.

@@ -1,31 +1,72 @@
 # SWARM-LINK
 
-Two separate **static 2D** benchmarks for DoA localization and ground-station connectivity. [SPEC.md](SPEC.md) defines project requirements; [IMPLEMENTATION.md](IMPLEMENTATION.md) records numerical rules, benchmark decisions, findings, limitations and future research. This iteration adds no movement, learning or new estimator.
+Reproducible **static and sequential 2D** DoA localization/connectivity experiments. [SPEC.md](SPEC.md) defines project requirements; [IMPLEMENTATION.md](IMPLEMENTATION.md) records numerical rules, benchmark decisions, verified findings and limitations. Sequential hold-still/random movement reuses the existing estimator; learning remains future work.
 
 ## Setup and tests
 
-Requires Python **3.12+**; tested with **3.14.8**, NumPy **2.5.4** and Matplotlib **3.11.2**. Only NumPy/Matplotlib are direct dependencies; tests use the standard library.
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/). Supports Python **3.12+**; `.python-version` selects the tested **3.14.8**. Only NumPy **2.5.4** and Matplotlib **3.11.2** are direct dependencies; tests use the standard library.
 
 ```sh
-uv venv --python python3.14 .venv
-uv pip install --python .venv/bin/python -r requirements.txt
-.venv/bin/python -m unittest discover -s tests -v
+uv sync --locked
+uv run --locked python -m unittest discover -s tests -v
 ```
 
-**36 tests pass**, including all 28 original checks and controlled sampling, pairing, scale, reproducibility, arbitrary-position reuse and output checks.
+Run commands from the project root. `uv sync --locked` creates or updates `.venv` from `uv.lock`, downloading the selected Python if needed. `uv run --locked` uses that environment without shell activation. Dependencies are declared in `pyproject.toml` (replacing `requirements.txt`); `uv.lock` records exact resolved versions and should be committed alongside `.python-version`.
 
-## Reproduce each benchmark
+List this project's installed packages with `uv pip list --python .venv/bin/python`. Use `uv add PACKAGE` or `uv remove PACKAGE` to change dependencies and update the lockfile; use `uv sync --locked` after pulling changes. The environment intentionally has no pip installation: bare `pip`/`pip3` can select a different Python, even after activation. Use `uv` commands for this project.
+
+**50 tests pass**: all 36 static/fairness checks plus 14 sequential checks for motion, cumulative history, disconnection/reconnection, pairing, scoring and output protection.
+
+## Sequential movement and cumulative history
+
+Main initial benchmark, **N=5, T=60**, one command:
+
+```sh
+uv run --locked python -m swarm_link --experiment sequential
+```
+
+Small debugging benchmark, **N=3, T=30**:
+
+```sh
+uv run --locked python -m swarm_link --experiment sequential --drone-counts 3 --steps 30 --seeds 11 29 --trials-per-seed 5
+```
+
+Both use Δt=2 s, vmax=5 m/s (≤10 m per move), an initial t=0 measurement and one after each move. Main duration is 120 simulated seconds; debug is 60 s. Defaults are provisional engineering choices. Main evaluates 200 paired controlled scenarios, polygon starts, ranges 200/350 m, and two controllers: **800 episodes**. Debug evaluates 40 episodes. Controllers share initial conditions, noise, sensing slots, horizons and movement limits; actual travel/delivery differ.
+
+`--steps`, `--step-seconds`, `--max-speed`, `--drone-counts`, `--initial-formations`, `--ranges`, seeds/counts and initial `--benchmark controlled|randomized` are configurable. `--initial-formations` affects initialization only; drones do not preserve formations. Use `--output` for an alternate run directory. Selecting an existing static benchmark directory is rejected.
+
+| Sequential evidence | Main N=5/T=60 | Debug N=3/T=30 |
+|---|---|---|
+| Numeric summary and paired confidence interval | [summary.md](results/sequential/controlled/n5-t60/summary.md) | [summary.md](results/sequential/controlled/n3-t30/summary.md) |
+| Complete metrics and setting breakdowns | [summary.json](results/sequential/controlled/n5-t60/summary.json) | [summary.json](results/sequential/controlled/n3-t30/summary.json) |
+| Protocol, parameters and measurement/outage conventions | [metadata.json](results/sequential/controlled/n5-t60/metadata.json) | [metadata.json](results/sequential/controlled/n3-t30/metadata.json) |
+| Matched trajectories and final connectivity | [trajectory.png](results/sequential/controlled/n5-t60/trajectory.png) | [trajectory.png](results/sequential/controlled/n3-t30/trajectory.png) |
+| Error, per-drone reachability and delivered history | [diagnostics.png](results/sequential/controlled/n5-t60/diagnostics.png) | [diagnostics.png](results/sequential/controlled/n3-t30/diagnostics.png) |
+| Earlier outage followed by terminal recovery | [reconnection.png](results/sequential/controlled/n5-t60/reconnection.png) | [Matched diagnostics](results/sequential/controlled/n3-t30/diagnostics.png) |
+
+Each sequential directory also contains `metrics.png`, `leaderboard.csv`, `by_setting.csv` and four generated raw logs:
+
+- `episodes.csv`: final error/Q, terminal/continuous outcomes, travel and delivered counts for every episode.
+- `steps.csv`: all T+1 snapshots, station estimate/diagnostics, reachability and cumulative delivery.
+- `drone_steps.csv`: each drone's acquisition position/bearing/noise, delivery, connectivity class/hops/components, requested/actual movement and event flags.
+- `drone_episodes.csv`: individual connected fraction, terminal/continuous states, total/longest outage exposure, event counts and travel.
+
+Raw sequential logs are ignored by version control. Main CSVs reproduced exactly across two runs. No static results were regenerated or changed. Definitions and findings are maintained once in IMPLEMENTATION.md §§3.9–4: terminal success permits earlier outages; continuous connectivity is stricter. Final-error Q uses terminal connectivity and validity only. Delivered history survives outages; offline measurements are never backfilled. No RL reward is chosen.
+
+![Sequential main evaluation](results/sequential/controlled/n5-t60/metrics.png)
+
+## Reproduce the preserved static benchmarks
 
 Controlled deployment, one command:
 
 ```sh
-.venv/bin/python -m swarm_link --benchmark controlled
+uv run --locked python -m swarm_link --benchmark controlled
 ```
 
 Randomized deployment, one command (also the default benchmark):
 
 ```sh
-.venv/bin/python -m swarm_link --benchmark randomized
+uv run --locked python -m swarm_link --benchmark randomized
 ```
 
 | Benchmark | Question | Output directory |
@@ -38,7 +79,7 @@ Each full run evaluates **1,000 paired scenarios × 3 swarm sizes × 3 ranges ×
 Controlled defaults use centre `(500, 350) m` and a uniform-area source disk of radius `75 m`. Change the source region without changing placement or noise streams:
 
 ```sh
-.venv/bin/python -m swarm_link --benchmark controlled --deployment-centre 500 350 --source-radius 150 --output results/controlled-radius150
+uv run --locked python -m swarm_link --benchmark controlled --deployment-centre 500 350 --source-radius 150 --output results/controlled-radius150
 ```
 
 There is no requirement for the source to lie inside a formation. Invalid sampling configurations are rejected before a run; disconnected/invalid **trials are retained**.
@@ -46,7 +87,7 @@ There is no requirement for the source to lie inside a formation. Invalid sampli
 A quick separate run:
 
 ```sh
-.venv/bin/python -m swarm_link --benchmark controlled --seeds 7 19 --trials-per-seed 10 --bootstrap-samples 200 --output /tmp/swarm-link-smoke
+uv run --locked python -m swarm_link --benchmark controlled --seeds 7 19 --trials-per-seed 10 --bootstrap-samples 200 --output /tmp/swarm-link-smoke
 ```
 
 `--help` lists all CLI options. Other numerical settings are explicit in `swarm_link/scenarios.py::Config`. Existing files in an explicitly selected output directory are replaced; use a different `--output` when changing configurations.
@@ -86,4 +127,4 @@ The original randomized artifacts remain untouched in `results/` ([original summ
 
 Metadata records the benchmark protocol (`controlled-v1` or `randomized-v1`), report format (`static-report-v2`), complete configuration/hash and software versions. Compare scenario/case IDs only within the same benchmark/configuration. A protocol version describes sampling/scoring rules, while the configuration hash distinguishes parameters such as source radius. Changed conditions require separate interpretation; no experiment-management framework is involved.
 
-The sensing, connectivity, LS and evaluation functions accept arbitrary valid positions. Formation/centre/source-prior constraints belong only to benchmark generation; later drones need not preserve formations. Future stages and research comparisons are documented in IMPLEMENTATION.md and are not implemented here.
+Sensing, connectivity, LS and evaluation accept arbitrary valid positions. Formation/centre/source-prior constraints belong only to initialization; sequential drones may move independently. Further active sensing, learned policies and environmental models remain documented future work in IMPLEMENTATION.md.

@@ -86,6 +86,8 @@ Scenario generator
 
 **Permanent rules vs benchmark choices:** sensing, graph reachability, LS and scoring accept arbitrary valid positions; the evaluator takes supplied drone/source positions and a configurable station. Fixed formations, a common centre, safe spawning envelope and source priors exist only in scenario generation/configuration. They do not constrain future motion, require formation preservation, keep drones near their spawn, or require sources inside a formation. Disconnected states remain representable and fail connectivity. Q is an evaluation metric, not a prescribed RL reward; no RL interfaces were added.
 
+**Implemented sequential order (`sequential-v1`):** measure/deliver/estimate at t=0 → for each of T steps: open-loop displacement → map-boundary truncation → new bearings/graph → append currently deliverable data → cumulative-history LS → log. Episodes continue through T despite outages. Controllers receive only team size, motion budget and independent RNG; truth remains restricted to sensing/evaluation. No formation must be preserved.
+
 ---
 
 ## 3. Component cards (inputs → operations → outputs → metrics)
@@ -109,11 +111,12 @@ Each card preserves the same **START / SUBMISSION / EXPAND** distinction. The al
 - **Outputs:** new positions `p_i,t+1`, displacement/travel cost, feasibility flags.
 - **Fixed:** drone formations and learned placement/coordination must be studied [REQUIRED]. No flight dynamics fixed.
 - **START implemented:** fixed placements only; no motion, action space or formation optimization. All formation centroids and RMS radii match; maximum extent may differ because geometry differs.
+- **Sequential implemented:** point-agent displacements with norm ≤ `vmax × Δt`; rectangular-wall clipping reduces actual movement and is logged. Travel sums actual displacements. No connectivity rejection, early outage termination, formation constraint, collision avoidance or acceleration model. Provisional defaults: §6; no validated UAV/training specifications are implied.
 - **SUBMISSION:** executable sequential movements, measurements after motion and multi-agent actions, with action feasibility recorded.
 - **EXPAND:** velocity/acceleration/yaw limits, obstacle avoidance, collision prevention, energy/wind flight-cost maps.
 - **Candidates:** discrete grid steps; bounded continuous displacement; waypoint commands; kinematic step; constrained projected action.
 - **Metrics:** path length [distance], final placement, steps to accuracy threshold, invalid/blocked action rate, optional energy.
-- **[OPEN]:** whether disconnected actions are rejected, projected, penalized or terminate the episode; max speed and discretization.
+- **[OPEN] for future learned control:** reward, constraint handling and richer dynamics. Current sequential moves may disconnect; only speed and map bounds constrain movement.
 
 ### 3.3 DoA sensor and measurement noise
 
@@ -121,11 +124,12 @@ Each card preserves the same **START / SUBMISSION / EXPAND** distinction. The al
 - **Outputs:** measured bearing(s) `z_i,t`, angle convention, uncertainty/validity metadata.
 - **Fixed:** DoA/bearing sensing [REQUIRED]; no range or RSS measurement is imposed. Gaussian angle noise [GUIDED].
 - **START implemented:** global-frame `atan2` bearing plus independent wrapped Gaussian noise; radians internally, known positions/headings. Identical per-drone angular noise is reused across matched formations/ranges. Source–sensor separation ≤ `1e-9 m` gives an undefined measurement, excluded with a logged missing-measurement count.
+- **Sequential implemented:** one bearing/drone at t=0 and after each move; independent noise across times, paired by scenario/step/drone across controllers. Equal generated sensing budgets do not imply equal delivered histories. Repeated-noise independence is an uncalibrated assumption.
 - **SUBMISSION:** characterize impact of noise over source locations and formations; log observations/variance; unit and frame consistency.
 - **EXPAND:** realistic antenna arrays, multipath/non-line-of-sight, bias/outliers, distance-dependent error, dropouts, joint noise.
 - **Candidates:** direct `atan2` bearing; wrapped-Gaussian angular noise; von Mises noise (extension).
 - **Metrics:** angular residual [radians/degrees], failure/dropout rate, estimator sensitivity to noise.
-- **[OPEN] beyond START:** heading errors, repeated/correlated measurements, covariance models and transmitter detectability. START assumes every non-colocated drone obtains one bearing; sensing does not depend on station connectivity.
+- **[OPEN] beyond current implementation:** heading errors, correlated measurements, covariance models and transmitter detectability. Sensing does not depend on station connectivity; delivery does.
 
 For a 2D point `s=(x_s,y_s)`, `p_i=(x_i,y_i)`, ideal bearing:
 
@@ -140,13 +144,14 @@ For a 2D point `s=(x_s,y_s)`, `p_i=(x_i,y_i)`, ideal bearing:
 - **Fixed:** *every* drone must reach the ground station directly or through other drones [REQUIRED].
 - **START implemented:** undirected `distance <= R` edges, including the station; BFS determines each drone's shortest station hop count. Also compute **drone-only** components, excluding paths through the station. Classes: `direct` (one station hop), `relay` (>1), `peer_only` (unreachable with drone neighbors), `isolated` (unreachable without neighbors). A directly connected drone with no drone neighbors is still `direct`.
 - **START reporting:** per-drone class/component/reachability/hops and estimator use; number of unreachable drones; full-swarm feasibility. **Any unreachable drone fails connectivity**, independently of localization. Unreachable measurements never enter the station estimator.
+- **Sequential reporting:** terminal connectivity requires all drones reachable at T; continuous connectivity requires this at every evaluated snapshot 0…T. Temporary outages/reconnection are allowed. Per-drone and swarm traces retain connected fractions, transition events, outage exposure and longest outage (§4). Terminal success never proves continuously maintained connectivity or reachability between snapshots.
 - **SUBMISSION:** evaluate/maintain reachability at appropriate time steps; restrict distributed information to connected pathways; vary link conditions.
-- **EXPAND:** probabilistic/asymmetric links, delay/bandwidth, interference, packet loss, network routing, learned messages.
+- **EXPAND (documentation only):** per-hop latency, packet loss, link quality, asymmetric/RF-dependent connectivity, obstacles, bandwidth/interference, routing and learned messages. None is implemented.
 - **Candidates:** breadth-first search / union-find for components; graph traversal from ground station; later graph policies.
 - **Metrics:** `C_t = 1` iff **all** drones can reach ground; fraction of connected steps/episodes; outage counts/duration; relay hops; feasible region.
 - **[OPEN] beyond START:** heterogeneous/station-specific ranges, continuous movement connectivity and communication delay. START uses one shared radius, one static instant and instantaneous lossless forwarding within the station component.
 
-**Important:** Fully interconnected drones disconnected from the station **fail** the requirement. “A drone has a neighbor” does not imply mission connectivity.
+**Important:** Fully interconnected drones disconnected from the station fail that snapshot's station reachability. Sequential reconnection may change the terminal outcome; report continuous connectivity separately. A neighbor does not imply a station route.
 
 ### 3.5 Transmitter localization estimator / belief
 
@@ -155,11 +160,12 @@ For a 2D point `s=(x_s,y_s)`, `p_i=(x_i,y_i)`, ideal bearing:
 - **Fixed:** localization error must be evaluated across geometries and source positions [REQUIRED]. Least squares [GUIDED].
 - **START implemented:** bearing-line LS via `numpy.linalg.lstsq`, centred on sensor positions. Only station-reachable, finite measurements are used. Detect insufficient data, rank deficiency (`rcond=1e-12`), numerical ill-conditioning (`condition > 1e6`), nonfinite inputs/solutions and solver failure.
 - **Ray check:** require positive projection onto every measured ray (`>1e-9 m`); otherwise `direction_inconsistent`. Log backward-ray count and wrapped angular residual RMS. Invalid estimates have **no coordinates/error**, rather than a fallback location. Valid estimates outside the map are not clipped. Nonlinear angular LS remains future work.
+- **Sequential history:** cumulative centralized `(acquisition position, bearing)` data, with timestamp/drone identity in logs. Direct/multihop deliveries arrive immediately; previously delivered data survives later outages. Offline measurements are unavailable and never uploaded retrospectively. Reconnection contributes new measurements only. Existing LS/validity checks are unchanged; history can support a valid estimate during a current outage.
 - **SUBMISSION:** estimator with noise-aware evaluation; handle degenerate geometry; optionally nonlinear angle least squares and uncertainty estimate; compare same estimator for all strategies.
 - **EXPAND:** robust M-estimators, Bayesian filters, particle filters, dynamic transmitter tracking, distributed consensus/belief fusion.
 - **Candidates:** weighted line-distance LS; nonlinear wrapped-angle LS; maximum likelihood; EKF/UKF/particle filter for sequential beliefs.
 - **Metrics:** Euclidean source-position error `e_t = ||s_hat_t - s_true||` [m]; RMSE/median/percentiles; failure and calibration rates; inference cost.
-- **[OPEN] beyond START:** history, priors, uncertainty and distributed estimation. START is one current snapshot, centralized at the ground station; the numerical conditioning and ray tolerances are explicit engineering defaults, not calibrated scientific thresholds.
+- **[OPEN] beyond current implementation:** sliding-window history, local buffering/delayed upload, distributed estimation, priors and calibrated uncertainty. Static START still uses one snapshot; sequential history assumes a stationary source. Numerical/ray tolerances remain engineering defaults.
 
 **Pitfall:** Closely parallel bearings can make the estimate unstable. The system needs an explicit “unobservable/ill-conditioned” outcome, not an apparently precise coordinate.
 
@@ -189,6 +195,7 @@ For independent bearings with angle variance `σ_i²` and `d_i²=(x_s-x_i)²+(y_
 - **Outputs:** baseline trajectories/positions and per-scenario experiment results.
 - **Fixed:** compare learned coordination against **fixed formations** [REQUIRED]. Additional non-learning movement baseline [RESEARCH but methodologically valuable].
 - **START implemented:** `line` (equally spaced), `polygon` (regular), `compact` (nearest square-lattice sites) and `random` (disk samples, recentered/rescaled). Formation generation never receives the transmitter. Random orientation and placement streams are independent of source truth. Same scenario ID, station, centre, bounds, RMS radius, N, range and per-drone noise across methods; equal one-bearing-per-drone budget.
+- **Sequential implemented:** `hold_still` (zero movement) versus `random_movement` (independent uniform-area displacement-disk draws per drone/step). Same initial source/station/positions, noise, horizon, sensing budget and maximum movement allowance; actual travel is reported separately. Initial formation is configurable and never an ongoing constraint. Neither controller receives truth, beliefs or graph/global state; no deliberate active-sensing/reconnection strategy is claimed.
 - **SUBMISSION:** same initial conditions/test instances, sensors, movement budget, estimator and connectivity tests as learned policy; comparisons across swarm sizes and link constraints.
 - **EXPAND:** connectivity-aware greedy Fisher-information planning, receding horizon / constrained optimization, classical active-sensing strategies from published work.
 - **Candidates:** fixed compact/line/polygon placements; random feasible control; information-greedy next waypoint; constrained optimizer.
@@ -204,7 +211,7 @@ For independent bearings with angle variance `σ_i²` and `d_i²=(x_s-x_i)²+(y_
 - **Inputs:** simulator transitions, local observations/messages, joint actions, reward and termination rules.
 - **Outputs:** trainable multi-agent environment, observation/action/reward traces, learned policies.
 - **Fixed:** multi-agent RL, observation/state/action/reward specification and learned coordination [REQUIRED]. No specific RL algorithm mandated.
-- **START status:** the static simulator and estimator information boundary are tested. No sequential environment step, controller, MARL library, policy or training infrastructure exists. Movement/active sensing and MARL remain subsequent stages; their decisions must precede implementation.
+- **Current status:** static evaluation and the sequential motion/history loop with two open-loop baselines are implemented/tested. No MARL library, training, RL adapter or agent-observation interface exists. Learned observations/reward/constraint handling and deliberate active sensing remain future decisions.
 - **SUBMISSION:** train a policy and compare to fixed formations under matched assumptions; evaluate on held-out scenarios; document training curves and seed variation.
 - **EXPAND:** constrained RL, decentralized execution with centralized training (CTDE), graph/invariant architectures, variable-sized teams, learned communications, curriculum/transfer.
 - **Algorithm candidates:** independent PPO, parameter-sharing PPO, MAPPO/CTDE, QMIX for suitable discrete cooperative actions, centralized joint-action RL as a diagnostic **(not automatically decentralized MARL)**; constrained MARL methods when hard connectivity is central.
@@ -249,6 +256,23 @@ For independent bearings with angle variance `σ_i²` and `d_i²=(x_s-x_i)²+(y_
 
 ---
 
+### Sequential movement and cumulative history — sequential-v1, 2026-10-23
+
+- **Implemented change:** reused existing initial samplers, sensing, graph, bearing-line LS and Q helper; extended existing experiment/connectivity/report/CLI modules only. All generated episodes/steps are retained. Static scoring and saved N=3/5/8 artifacts are unchanged. Full numerical evidence is in the separate sequential reports linked from README.
+- **Main configuration:** 200 paired controlled scenarios (8 seeds × 25), polygon starts, N=5/T=60, ranges 200/350 m: **800 episodes**, **48,800 snapshots**, **244,000 drone snapshots**, 120 simulated seconds and 305 generated bearing slots per episode. This diagnoses blind movement from informative initial geometry; it does not establish training requirements.
+
+| Controller | Mean Q | Terminal % | Continuous % | Final mean / median / RMSE [m] | Mean total travel [m] |
+|---|---:|---:|---:|---:|---:|
+| hold_still | 0.999694 | 100.00 | 100.00 | 0.434 / 0.385 / 0.499 | 0 |
+| random_movement | 0.907209 | 90.75 | 84.00 | 0.454 / 0.422 / 0.514 | 1999.23 |
+
+- **Interpretation:** 27/400 random episodes finish connected after an earlier outage and receive positive final Q; 37 finish disconnected and score zero despite valid historical estimates. Random movement records **598 per-drone disconnection / 460 reconnection events**. Main final estimates are all valid. Paired Q(random−hold) is **−0.09248**, exploratory 95% CI **[−0.11998, −0.06749]**. Blind motion does not help this near-source, initially informative geometry; this says nothing conclusive about deliberate active sensing or RL. At 200 m, random terminal/continuous rates are **81.5% / 68%**, versus 100%/100% at 350 m. Conditional error subsets differ; Q includes every episode.
+- **Debug run:** N=3/T=30, 2 seeds × 5 scenes, same ranges: 40 episodes over 60 simulated seconds. Hold terminal/continuous **90%/90%**; random **85%/65%**. Its paired-Q interval crosses zero; this small run verifies behavior rather than establishing performance.
+- **Verified:** **50 tests pass** (36 earlier + 14 sequential): t=0/budgets, acquisition poses/history retention, no retrospective upload, terminal-vs-continuous scoring, persistent outages without early exit, speed/wall/travel limits, pairing/repeatability, source-blind actions, variable N/horizons, denominators and static-output protection. Hashes preserve prior static artifacts, SPEC.md, locked dependencies and sensing/LS code. RNG purpose/time keys are separate (the initial offset scheme could collide at long horizons); the helper was minimally extended while preserving legacy draws. Empty-estimate/CDF plots were clarified; no new algorithm was introduced. Final audit: all eight main CSV/JSON outputs reproduce exactly; all 44 protected files other than the deliberately extended RNG helper remain unchanged. Saved main/debug logs verify every history count, paired noise/initial position, speed/travel limit, outage/event definition, terminal/continuous outcome and Q. No failing checks remain.
+- **Limits/future alternatives:** ideal point motion, known positions/headings and a static source; no collision/acceleration, wind, terrain or energy model. Independent repeated noise helps hold-still averaging and remains uncalibrated. Cumulative history grows with T; sliding windows, local buffering/delayed upload, distributed estimation, per-hop latency, packet loss, link quality, obstacles and RF-dependent links remain documentation only. Connectivity/exposure are sampled approximations, not continuous-flight guarantees. No large-N/horizon study or new estimator was introduced; the extreme-line-error investigation above remains postponed.
+- **Future controller information:** deliberate reconnection may need communication status, neighbors, past connected positions or routing. Reversing the last action cannot guarantee a route in a changing graph. Exact RL-agent observations, reward and constraint handling remain open; no privileged-state interface was added. Study: temporal bearing observability, cumulative-noise assumptions, graph transitions, outage sampling and paired trajectories; §8 [L1], [L2], [L6] are reading targets, not replicated algorithms.
+
+
 ## 4. Metrics dictionary — **define denominators before coding**
 
 | Metric | Definition or reporting convention | Use / caveat |
@@ -265,8 +289,12 @@ For independent bearings with angle variance `σ_i²` and `d_i²=(x_s-x_i)²+(y_
 | **Unreachable drones** | Count per trial, total and mean per formation | Any positive count fails full-swarm connectivity, regardless of error. |
 | **CRLB / SPEB** | `trace(J^-1)` [m²], or `sqrt(trace(J^-1))` [m] | Under specified DoA noise model; oracle vs estimated-source evaluation must be labeled. |
 | **All-connected indicator** | `C_t=1` if every drone has a graph path to the station | Core constraint; not average node degree. |
-| **Connectivity rate** | START: `100 * fully_connected_trials / all_trials`; sequential: mean of `C_t` over specified steps | Strict binary feasibility, independent of localization error; sequential outage measures remain future work. |
+| **Connectivity rate** | Static: `100 * fully_connected_trials / all_trials`; sequential: separate terminal %, continuous % and connected-snapshot fractions | Connectivity never depends on localization-error thresholds. |
 | **Episode connectivity** | Fraction of episodes with `C_t=1` at **all evaluated steps** | Useful for hard constraint compliance. |
+| **Sequential terminal / continuous** | Terminal: all drones station-reachable at T. Continuous: all reachable at every evaluated snapshot `0…T` | Temporary outages are allowed; never equate terminal success with maintained connectivity. No early outage termination/rejection. |
+| **Sequential connected-step fraction** | Per-drone mean reachability over **T+1 snapshots**, including t=0; swarm fraction uses all-drone reachability | Keep individual reachability separate from full-swarm outcomes. |
+| **Sequential outage exposure / events** | Total/longest disconnected left-endpoint intervals `0…T−1` × Δt; events use adjacent reachability transitions | Exposure ≤ TΔt. Initial outage is not a disconnection event; final-only outage adds no observed interval. A stated discrete approximation. |
+| **Sequential final-error Q / accuracy** | `Q=L/(L+e_T)` iff terminal-connected and final estimate valid; otherwise 0; mean across **all episodes**. Mean/median/RMSE use final valid, terminal-connected episodes | No error cutoff or continuous-connectivity gate. Preserve exclusion counts/failures. Separate experimental convention; RL reward remains open. |
 | **Connectivity outage** | Number/duration of `C_t=0` intervals | Define discrete sampling / continuous move semantics. |
 | **Travel cost** | `Σ_t Σ_i ||p_i,t+1-p_i,t||` [m] | Not equivalent to energy if wind/flight dynamics omitted. |
 | **Steps to target** | First `t` meeting the localization threshold | Treat failures/censored episodes consistently. |
@@ -296,9 +324,9 @@ EvalRecord     {seed, scenario_id, method, time, error, graph_status, travel, fa
 
 **Future field names and optional members above remain illustrative [OPEN].** The *separation of responsibilities* is the important design property.
 
-**Actual START code:** `scenarios.py` (`Config`, `Scenario`, formations), `localization.py` (`Estimate`, sensing/LS), `connectivity.py` (`Network`), `experiment.py` (`Trial`, scoring/summaries), `report.py` (exports/plots) and `__main__.py` (CLI). Other records above remain conceptual; no motion/policy/map abstractions or stubs were built. Ground truth is used only in scenario generation, sensing, evaluator records and diagnostic plots, never as an estimator or formation input.
+**Actual code:** same module structure: `scenarios.py` (initial scenarios/formations), `localization.py` (unchanged sensing/LS), `connectivity.py` (graph plus reachability-time metrics), `experiment.py` (static trials and sequential motion/history/baselines/summaries), `report.py` (exports/plots) and `__main__.py` (CLI). No new modules/dependencies, controller hierarchy, RL adapter or map abstraction. Controllers receive only `controller_displacements(controller, n_drones, rng, max_displacement)`; other future records above remain conceptual. Ground truth stays in scenario generation, sensing and evaluator records/plots.
 
-Suggested invariants/tests (sequential items remain future work):
+Implemented invariants/tests (future RL observations remain undecided):
 
 1. Zero-noise, non-degenerate bearings recover the source within numerical tolerance.
 2. Angular wrapping gives small residual across the `±π` boundary.
@@ -319,15 +347,16 @@ The START choices below are **agreed implementation decisions**, not supervisor 
 |---|---|---|
 | START world/source | Distinguish local geometry from broad deployment robustness | **Implemented:** same `[0,1000]² m` map and station `(500,100) m`. Randomized: source uniform throughout map. Controlled: source uniform in area within a disk of default radius `75 m` around fixed centre `(500,350) m`; both centre/radius configurable and saved. No convex-hull test. These are benchmark defaults, not simulator constraints. |
 | Deployment centre/orientation | Avoid source-aware placement and boundary clipping | **Implemented:** randomized centre uniform in the shared safe square; controlled centre fixed. Shared safe margin `sqrt(max N−1)*100 = 264.575 m`; uniform matched heading `[-π,π)` in both benchmarks. All formations share centroid and `100 m` RMS radius. Reject invalid benchmark configurations (disk/envelope outside map), never outcome-dependent trials. |
-| Who owns the estimate? | Only measurements deliverable to the station may be used | **Implemented:** ground-station snapshot fusion; unreachable bearings excluded, even if the partial estimate would be accurate. |
+| Who owns the estimate? | Only successfully delivered data may enter station inference | **Implemented:** static snapshot fusion; sequential cumulative station history. Current offline measurements are excluded; earlier deliveries remain stored after disconnection, with no backfill. |
 | Precisely what each drone knows | “Known drone positions” initial assumption does not imply instantaneous global message access | [GUIDED] knowledge; exact observation [OPEN] |
 | DoA angular reference and sensor heading | Consistent interpretation of directed rays | **Implemented:** radians, global +x zero, counterclockwise, wrap to `[-π,π)`; known heading; independent Gaussian noise `σ=2°`. |
-| Histories and repeated observation correlation | Valid interpretation of information accumulation | **Implemented:** one bearing per non-colocated drone; no history. Correlated/sequential measurements remain [OPEN]. |
-| Hard connectivity vs penalty | Strict feasibility is separate from continuous accuracy | **Implemented:** static feasibility iff every drone is station-reachable; symmetric shared radii `200/350/500 m`; no rejection/penalty optimization. Movement enforcement remains [OPEN]. |
-| Static baseline evaluation budget | Avoid measurement-count advantages | **Implemented:** equal N, one snapshot, paired noise/source/centre/orientation per setting. Movement-budget matching remains future work. |
+| Histories and repeated observation correlation | Valid information accumulation | **Implemented:** independent noise each snapshot; cumulative acquisition-position history for a static source. Sliding windows, buffering/delay, correlation and distributed fusion remain future alternatives. |
+| Hard connectivity vs penalty | Separate terminal, continuous and accuracy outcomes | **Implemented:** static all-drone snapshot feasibility unchanged. Sequential outages/reconnections are allowed; final-error Q uses terminal connectivity. No connectivity-dependent move rejection/early exit. Future RL handling remains [OPEN]. |
+| Sequential defaults / budgets | Provisional diagnostic choices, not validated UAV/training specifications | **Implemented:** main N=5/T=60; debug N=3/T=30; Δt=2 s, vmax=5 m/s (≤10 m/step). Initial t=0 measurement plus one per move. Default controlled polygon starts, ranges 200/350 m, 8 seeds × 25 scenes; all configurable. No fixed-five-drone/60-step numerical assumptions. |
+| Baseline evaluation budget | Avoid sensing/horizon advantages | **Implemented:** static one-snapshot comparisons unchanged. Sequential controllers share initialization, `(T+1)N` generated slots, angular noise, horizon and movement limits; actual travel/delivered counts are separately reported. |
 | Policy learning setup | Centralized/independent/CTDE/parameter sharing and variable team-size handling | [OPEN], MARL [REQUIRED] |
 | Reward and termination | Determines optimization behavior and prevents degenerate policies | [OPEN] |
-| Test distribution and trial budget | Replication and honest uncertainty | **Implemented:** seeds `11,29,47,71,101,131,173,211`, 125 scenes each, `N=3/5/8`, three ranges, four formations. Balanced setting weights. 2,000 percentile bootstrap replicates of whole scenario IDs (fixed analysis seed), paired across methods and keeping settings together; per-seed variability saved. No training split or map generalization claimed. |
+| Static test distribution and trial budget | Replication and honest uncertainty | **Implemented:** seeds `11,29,47,71,101,131,173,211`, 125 scenes each, `N=3/5/8`, three ranges, four formations. Balanced setting weights. 2,000 percentile bootstrap replicates of whole scenario IDs (fixed analysis seed), paired across methods and keeping settings together; per-seed variability saved. No training split or map generalization claimed. |
 | Realism/integration | Ray tracing/wind/3D changes modeling burden and may obscure the core research | [RESEARCH] unless requested later |
 
 **Rule for Codex:** Keep this living document aligned with verified implementation, preserving its section structure and START / SUBMISSION / EXPAND progression. Present consequential unresolved choices explicitly; record selected choices here, keep the change log concise and leave `SPEC.md` unchanged without approval. Never describe a selected candidate as “what the professors required.”
@@ -381,3 +410,5 @@ The START choices below are **agreed implementation decisions**, not supervisor 
 |---|---|---|
 | 2026-10-23 | Completed static START experiment; recorded agreed connectivity, ray/LS validity, paired formation fairness and empirical-Q decisions in §§2–6. Added README, lean AGENTS instructions, numerical code, focused tests and reproducible artifacts. | 28 tests pass; two full runs reproduce raw logs exactly; findings/limits in §3.9. SUBMISSION/EXPAND remain documented future stages. |
 | 2026-10-23 | Added controlled-v1 beside unchanged randomized-v1; separate reports, source-disk configuration, labelled scene/error/disconnected plots and L rescoring. Documented benchmark/core separation, incremental-comparison principles and postponed line-error study. | 36 tests pass; results/limits in §3.9. No new Python modules, dependencies or future-stage infrastructure. |
+| 2026-10-23 | Migrated environment setup to a uv project: `pyproject.toml` replaces `requirements.txt`, `.python-version` pins tested Python 3.14.8, and `uv.lock` locks all dependencies. README uses `uv sync --locked` / `uv run --locked` and explains package inspection without bare pip. No build backend or new dependency. | Locked sync and lock consistency check pass; `uv pip check` reports compatible packages; all 36 tests pass through `uv run --locked`; CLI help works. Verified interpreter is project `.venv` with unchanged NumPy 2.5.4 / Matplotlib 3.11.2. Other supported Python versions and clean-machine Python downloads were not tested. Setup reference: [uv project guide](https://docs.astral.sh/uv/guides/projects/). |
+| 2026-10-23 | Added sequential-v1: bounded hold/random motion, cumulative station history, sampled outages/reconnections, separate terminal/continuous outcomes and final-error Q. Existing modules extended; static artifacts preserved. | 50 tests pass; main/debug and repeat-run findings, limits and study pointers in §3.9. RL, deliberate reconnection, wind/terrain and new estimators remain unimplemented. |

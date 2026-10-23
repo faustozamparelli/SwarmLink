@@ -64,3 +64,23 @@ def analyze_network(positions, station, communication_range):
     categories = ["direct" if hops[i] == 1 else "relay" if hops[i] > 1 else
                   "peer_only" if adjacency[i, :n].any() else "isolated" for i in range(n)]
     return Network(adjacency, components, component_id, hops, categories)
+
+
+def reachability_metrics(reachable, step_seconds):
+    """Snapshot outcomes and left-endpoint outage exposure over T intervals."""
+    reachable = np.asarray(reachable, dtype=bool)
+    if reachable.ndim != 1 or not len(reachable) or not np.isfinite(step_seconds) or step_seconds <= 0:
+        raise ValueError("Expected nonempty reachability snapshots and a positive time step")
+    longest = current = 0
+    for disconnected in ~reachable[:-1]:
+        current = current + 1 if disconnected else 0
+        longest = max(longest, current)
+    return dict(
+        initially_connected=bool(reachable[0]), terminal_connected=bool(reachable[-1]),
+        continuously_connected=bool(reachable.all()), connected_step_fraction=float(reachable.mean()),
+        disconnected_samples=int((~reachable).sum()),
+        disconnection_events=int(np.count_nonzero(reachable[:-1] & ~reachable[1:])),
+        reconnection_events=int(np.count_nonzero(~reachable[:-1] & reachable[1:])),
+        outage_duration_s=float(np.count_nonzero(~reachable[:-1]) * step_seconds),
+        longest_outage_s=float(longest * step_seconds),
+    )

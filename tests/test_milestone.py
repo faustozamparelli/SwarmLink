@@ -4,15 +4,18 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
 
-from swarm_link.connectivity import analyze_network
+from swarm_link.connectivity import analyze_network, reachability_metrics
 from swarm_link.experiment import (build_summaries, evaluate_trial, mean_ci,
-                                   quality_score, run_experiments, summarize)
+                                   quality_score, run_experiments, summarize,
+                                   run_episode, run_sequential, move_positions,
+                                   controller_displacements, build_sequential_summaries, summarize_episodes)
 from swarm_link.localization import estimate_position, sense_bearings, wrap_angle
-from swarm_link.report import save_results
+from swarm_link.report import save_results, save_sequential_results
 from swarm_link.scenarios import (Config, FORMATIONS, formation_positions,
                                   make_scenario, rng_for)
 
@@ -353,6 +356,176 @@ class ControlledDeploymentTests(unittest.TestCase):
                        replace(self.config, deployment_centre=(0., 0.)), replace(self.config, benchmark="unknown")):
             with self.assertRaises(ValueError):
                 config.validate()
+
+
+class SequentialTests(unittest.TestCase):
+    def setUp(self):
+        self.config = Config(benchmark="controlled", seeds=(7, 19), trials_per_seed=2,
+                             drone_counts=(3,), communication_ranges=(200., 350.), bootstrap_samples=50)
+        self.scenario = replace(make_scenario(self.config, 7, 0), source=np.array([10., 10.]), noise_rad=np.zeros(3))
+        self.positions = np.array([[1., 0.], [1., 1.], [0., 1.]])
+        self.exact = replace(self.config, station=(0., 0.), noise_std_deg=0.)
+
+    def test_initial_measurement_and_hold_still_history(self):
+        episode, steps, drones, metrics = run_episode(self.exact, self.scenario, self.positions, 100, "hold_still", 4)
+        self.assertEqual([row["time_s"] for row in steps], [0, 2, 4, 6, 8])
+        self.assertEqual([row["cumulative_measurements"] for row in steps], [3, 6, 9, 12, 15])
+        self.assertEqual(episode["generated_measurements"], 15)
+        self.assertEqual(episode["duration_s"], 8)
+        self.assertEqual(episode["swarm_travel_m"], 0)
+        self.assertTrue(episode["terminal_connected"] and episode["continuously_connected"])
+        self.assertTrue(all(row["measurement_delivered"] for row in drones))
+        self.assertTrue(all(row["outage_duration_s"] == 0 for row in metrics))
+
+    def test_reconnection_retains_old_history_without_backfilling_outage(self):
+        actions = [np.tile([3., 0.], (3, 1)), np.tile([-3., 0.], (3, 1))]
+        with patch("swarm_link.experiment.controller_displacements", side_effect=actions), \
+             patch("swarm_link.experiment.estimate_position", wraps=estimate_position) as estimator:
+            episode, steps, drones, metrics = run_episode(self.exact, self.scenario, self.positions, 1.5, "random_movement", 2)
+        self.assertEqual([row["fully_connected"] for row in steps], [True, False, True])
+        self.assertEqual([row["cumulative_measurements"] for row in steps], [3, 3, 6])
+        self.assertTrue(steps[1]["estimate_valid"])
+        self.assertEqual(episode["generated_measurements"], 9)
+        self.assertTrue(episode["terminal_connected"])
+        self.assertFalse(episode["continuously_connected"])
+        self.assertAlmostEqual(episode["quality"], 1)
+        self.assertEqual(episode["outage_duration_s"], 2)
+        for row in metrics:
+            self.assertEqual(row["disconnection_events"], 1)
+            self.assertEqual(row["reconnection_events"], 1)
+            self.assertEqual(row["outage_duration_s"], 2)
+        self.assertTrue(all(not row["measurement_delivered"] for row in drones if row["step"] == 1))
+        assert_array_equal(estimator.call_args.args[0], np.vstack((self.positions, self.positions)))
+
+    def test_initially_disconnected_data_never_uploads_after_reconnection(self):
+        initial = self.positions + [3, 0]
+        with patch("swarm_link.experiment.controller_displacements", return_value=np.tile([-3., 0.], (3, 1))), \
+             patch("swarm_link.experiment.estimate_position", wraps=estimate_position) as estimator:
+            episode, steps, _, metrics = run_episode(self.exact, self.scenario, initial, 1.5, "random_movement", 1)
+        self.assertEqual([row["cumulative_measurements"] for row in steps], [0, 3])
+        self.assertEqual(steps[0]["estimate_status"], "insufficient_measurements")
+        assert_array_equal(estimator.call_args.args[0], self.positions)
+        self.assertTrue(episode["terminal_connected"])
+        self.assertFalse(episode["continuously_connected"])
+        self.assertTrue(all(row["disconnection_events"] == 0 and row["reconnection_events"] == 1 for row in metrics))
+
+    def test_final_disconnection_zeros_score_but_keeps_valid_prior_estimate(self):
+        with patch("swarm_link.experiment.controller_displacements", return_value=np.tile([3., 0.], (3, 1))):
+            episode, steps, _, _ = run_episode(self.exact, self.scenario, self.positions, 1.5, "random_movement", 1)
+        self.assertTrue(episode["estimate_valid"])
+        self.assertFalse(episode["terminal_connected"])
+        self.assertEqual(episode["quality"], 0)
+        self.assertEqual(steps[-1]["cumulative_measurements"], 3)
+
+    def test_persistent_disconnection_never_ends_episode_early(self):
+        episode, steps, drones, metrics = run_episode(self.exact, self.scenario, self.positions + 100, 1, "hold_still", 5)
+        self.assertEqual(len(steps), 6)
+        self.assertEqual(len(drones), 18)
+        self.assertEqual(episode["quality"], 0)
+        self.assertEqual(episode["outage_duration_s"], 10)
+        self.assertTrue(all(row["outage_duration_s"] == 10 for row in metrics))
+        self.assertTrue(all(row["estimate_x_m"] is None for row in steps))
+
+    def test_history_keeps_each_acquisition_position(self):
+        action = np.tile([1., 0.], (3, 1))
+        with patch("swarm_link.experiment.controller_displacements", return_value=action), \
+             patch("swarm_link.experiment.estimate_position", wraps=estimate_position) as estimator:
+            episode, _, _, _ = run_episode(self.exact, self.scenario, self.positions, 100, "random_movement", 2)
+        expected = np.vstack((self.positions, self.positions + action, self.positions + 2*action))
+        assert_array_equal(estimator.call_args.args[0], expected)
+        self.assertLess(episode["error_m"], 1e-10)
+
+    def test_motion_limit_wall_truncation_and_actual_travel(self):
+        for seed in range(20):
+            action = controller_displacements("random_movement", 7, rng_for(seed, 0, 99), 10)
+            self.assertTrue(np.all(np.linalg.norm(action, axis=1) <= 10))
+        assert_array_equal(move_positions([[999, 999]], [[6, 8]], [1000, 1000], 10), [[1000, 1000]])
+        with self.assertRaises(ValueError):
+            move_positions([[0, 0]], [[10, 10]], [1000, 1000], 10)
+        with patch("swarm_link.experiment.controller_displacements", return_value=np.tile([6., 8.], (3, 1))):
+            episode, _, drones, _ = run_episode(self.config, self.scenario, self.positions + 999, 2000, "random_movement", 1)
+        self.assertTrue(all(row["boundary_limited"] for row in drones if row["step"] == 1))
+        self.assertLess(episode["swarm_travel_m"], 30)
+
+    def test_reachability_duration_and_event_conventions(self):
+        metrics = reachability_metrics([True, False, False, True, False], 2)
+        self.assertEqual(metrics["outage_duration_s"], 4)
+        self.assertEqual(metrics["longest_outage_s"], 4)
+        self.assertEqual(metrics["disconnection_events"], 2)
+        self.assertEqual(metrics["reconnection_events"], 1)
+        self.assertEqual(metrics["connected_step_fraction"], .4)
+        self.assertEqual(reachability_metrics([True, False], 2)["outage_duration_s"], 0)
+        self.assertEqual(reachability_metrics([False, False, True], 2)["outage_duration_s"], 4)
+
+    def test_zero_horizon_and_other_swarm_sizes_are_supported(self):
+        for n in (2, 7):
+            scene = replace(self.scenario, noise_rad=np.zeros(n))
+            positions = np.column_stack((np.arange(n)+1., np.arange(n) % 2))
+            episode, steps, drones, _ = run_episode(self.exact, scene, positions, 100, "hold_still", 0)
+            self.assertEqual(episode["generated_measurements"], n)
+            self.assertEqual(episode["duration_s"], 0)
+            self.assertEqual(len(steps), 1)
+            self.assertEqual(len(drones), n)
+
+    def test_matched_budgets_initial_conditions_noise_and_repeatability(self):
+        # Separate purpose/time keys avoid collisions when configuring longer horizons.
+        self.assertNotEqual(rng_for(7, 0, 5000, 1).random(), rng_for(7, 0, 3000, 2001).random())
+        legacy = np.random.Generator(np.random.PCG64(np.random.SeedSequence([7, 0, 3])))
+        assert_array_equal(rng_for(7, 0, 3).normal(size=8), legacy.normal(size=8))
+        output = run_sequential(self.config, movement_steps=3)
+        self.assertEqual(output, run_sequential(self.config, movement_steps=3))
+        episodes, _, drones, _ = output
+        cases = {}
+        for row in episodes:
+            cases.setdefault(row["case_id"], []).append(row)
+            self.assertEqual(row["generated_measurements"], 12)
+        self.assertTrue(all(len(rows) == 2 for rows in cases.values()))
+        paired = {}
+        for row in drones:
+            key = (row["case_id"], row["step"], row["drone_id"])
+            paired.setdefault(key, []).append(row)
+        for rows in paired.values():
+            self.assertEqual(rows[0]["noise_rad"], rows[1]["noise_rad"])
+            if rows[0]["step"] == 0:
+                self.assertEqual((rows[0]["x_m"], rows[0]["y_m"]), (rows[1]["x_m"], rows[1]["y_m"]))
+
+    def test_controller_actions_cannot_depend_on_hidden_source(self):
+        changed = replace(self.scenario, source=np.array([800., 800.]))
+        first = run_episode(self.config, self.scenario, self.positions, 1000, "random_movement", 5)[2]
+        second = run_episode(self.config, changed, self.positions, 1000, "random_movement", 5)[2]
+        self.assertEqual([(r["x_m"], r["y_m"]) for r in first], [(r["x_m"], r["y_m"]) for r in second])
+        self.assertEqual(list(inspect.signature(controller_displacements).parameters), ["controller", "n_drones", "rng", "max_displacement"])
+
+    def test_sequential_metric_denominators_use_terminal_not_continuous(self):
+        base = run_episode(self.exact, self.scenario, self.positions, 100, "hold_still", 0)[0]
+        rows = [dict(base, scenario_id="a", continuously_connected=False, quality=1., error_m=0.),
+                dict(base, scenario_id="b", terminal_connected=False, continuously_connected=False, quality=0.),
+                dict(base, scenario_id="c", estimate_valid=False, estimate_status="rank_deficient", quality=0., error_m=None)]
+        summary = summarize_episodes(rows, 50)
+        self.assertAlmostEqual(summary["mean_quality"], 1/3)
+        self.assertAlmostEqual(summary["terminal_connectivity_pct"], 200/3)
+        self.assertAlmostEqual(summary["continuous_connectivity_pct"], 100/3)
+        self.assertEqual(summary["accuracy_episodes"], 1)
+
+    def test_sequential_artifacts_and_static_directory_protection(self):
+        settings = dict(movement_steps=2, step_seconds=2., max_speed=5., initial_formations=("polygon",))
+        output = run_sequential(self.config, **settings)
+        summary = build_sequential_summaries(output[0], 50)
+        with tempfile.TemporaryDirectory() as directory:
+            save_sequential_results(directory, self.config, settings, *output, summary)
+            for name in ("metadata.json", "summary.json", "episodes.csv", "steps.csv", "drone_steps.csv",
+                         "drone_episodes.csv", "trajectory.png", "diagnostics.png", "metrics.png", "summary.md"):
+                self.assertGreater((Path(directory) / name).stat().st_size, 20)
+            metadata = Path(directory) / "metadata.json"
+            metadata.write_text('{"experiment":"static"}')
+            with self.assertRaises(ValueError):
+                save_sequential_results(directory, self.config, settings, *output, summary)
+            self.assertEqual(metadata.read_text(), '{"experiment":"static"}')
+
+    def test_invalid_movement_parameters_fail(self):
+        for kwargs in (dict(movement_steps=-1), dict(step_seconds=0), dict(max_speed=-1)):
+            with self.assertRaises(ValueError):
+                run_episode(self.config, self.scenario, self.positions, 100, "hold_still", **kwargs)
 
 
 if __name__ == "__main__":

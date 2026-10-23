@@ -1,4 +1,4 @@
-"""CSV/JSON evidence and static scientific figures for the baseline experiment."""
+"""CSV/JSON evidence and scientific figures for static/sequential experiments."""
 
 import csv
 from dataclasses import asdict
@@ -14,6 +14,8 @@ from matplotlib.lines import Line2D
 import numpy as np
 
 from .scenarios import FORMATIONS
+from .experiment import CONTROLLERS
+from .connectivity import analyze_network
 
 
 COLORS = {"line": "#5766b4", "polygon": "#008776", "compact": "#cb7a18", "random": "#b74d75"}
@@ -233,3 +235,162 @@ def save_results(output, config, records, drone_records, scenes, summaries):
     (output / "summary.md").write_text(markdown)
     plot_scenes(config, scenes[:4], output / "scene.png")
     plot_metrics(config, records, summaries, output / "metrics.png")
+
+
+def plot_episode(config, case_id, episodes, steps, drones, output, diagnostic_name="diagnostics.png"):
+    """Show a matched case; truth is used only by these evaluator plots."""
+    colors = {"hold_still": COLORS["polygon"], "random_movement": COLORS["random"]}
+    fig, axes = plt.subplots(3, 2, figsize=(11, 9), sharey="row", layout="constrained")
+    trajectory, scene_axes = plt.subplots(1, 2, figsize=(11, 5), layout="constrained")
+    for column, controller in enumerate(CONTROLLERS):
+        episode = next(row for row in episodes if row["case_id"] == case_id and row["controller"] == controller)
+        state = [row for row in steps if row["case_id"] == case_id and row["controller"] == controller]
+        agent = [row for row in drones if row["case_id"] == case_id and row["controller"] == controller]
+        times = [row["time_s"] for row in state]
+        n = episode["n_drones"]
+        errors = [row["error_m"] if row["estimate_valid"] else np.nan for row in state]
+        axes[0, column].plot(times, errors, color=colors[controller])
+        axes[0, column].set(title=controller.replace("_", " "), ylabel="Station error [m]", yscale="symlog",
+                            xlabel="Simulated time [s]", xlim=(0, max(times[-1], 1)))
+        if not np.isfinite(errors).any():
+            axes[0, column].text(.5, .5, "No valid station estimate", ha="center", transform=axes[0, column].transAxes)
+        reachability = np.array([row["station_reachable"] for row in agent]).reshape(len(state), n).T
+        image_plot = axes[1, column].imshow(reachability, origin="lower", aspect="auto", vmin=0, vmax=1,
+                                          cmap="RdYlGn", extent=[-.5, len(state)-.5, -.5, n-.5], interpolation="nearest")
+        axes[1, column].set(xlabel="Evaluated step (includes t=0)", ylabel="Drone ID", yticks=range(n))
+        axes[2, column].plot(times, [row["cumulative_measurements"] for row in state], color=colors[controller], label="Delivered history")
+        axes[2, column].plot(times, np.arange(1, len(state)+1) * n, "--", color="#777777", label="Generated budget")
+        axes[2, column].set(xlabel="Simulated time [s]", ylabel="Bearing count")
+        axes[2, column].legend(fontsize=8)
+        ax = scene_axes[column]
+        final = [row for row in agent if row["step"] == state[-1]["step"]]
+        points = np.array([[row["x_m"], row["y_m"]] for row in final])
+        network = analyze_network(points, config.station, episode["communication_range_m"])
+        vertices = np.vstack((points, config.station))
+        for i, j in zip(*np.where(np.triu(network.adjacency, 1))):
+            ax.plot(vertices[[i, j], 0], vertices[[i, j], 1], color="#8e9ea8", alpha=.5, lw=.8)
+        for i in range(n):
+            path_rows = [row for row in agent if row["drone_id"] == i]
+            ax.plot([row["x_m"] for row in path_rows], [row["y_m"] for row in path_rows], color=colors[controller], alpha=.6, lw=1)
+            ax.scatter(path_rows[0]["x_m"], path_rows[0]["y_m"], facecolors="none", edgecolors="#444444", s=65)
+            ax.scatter(*points[i], color=NETWORK_COLORS[final[i]["connectivity"]], s=35, zorder=4)
+            ax.annotate(str(i), points[i], xytext=(4, 4), textcoords="offset points", fontsize=8)
+        ax.scatter(*config.station, marker="s", color="#202b39", s=75)
+        ax.scatter(episode["source_x_m"], episode["source_y_m"], marker="*", color="#202b39", s=130, zorder=5)
+        xlim, ylim = (0, config.width), (0, config.height)
+        if state[-1]["estimate_valid"]:
+            estimate = [state[-1]["estimate_x_m"], state[-1]["estimate_y_m"]]
+            ax.scatter(*estimate, marker="x", color="#b80052", s=70, zorder=6)
+            ax.plot([episode["source_x_m"], estimate[0]], [episode["source_y_m"], estimate[1]], "--", color="#b80052", lw=1)
+            xlim = (min(0, estimate[0]-20), max(config.width, estimate[0]+20))
+            ylim = (min(0, estimate[1]-20), max(config.height, estimate[1]+20))
+        ax.set(xlim=xlim, ylim=ylim, aspect="equal", xlabel="x [m]", ylabel="y [m]")
+        ax.set_title(f'{controller.replace("_", " ")}\nterminal={episode["terminal_connected"]}, continuous={episode["continuously_connected"]}\n'
+                     f'final error={format_number(episode["error_m"])} m; Q={episode["quality"]:.3f}', fontsize=10)
+        ax.grid(alpha=.15)
+    fig.colorbar(image_plot, ax=axes[1, :], ticks=[0, 1], label="Station reachability (0=unreachable, 1=reachable)", shrink=.85)
+    fig.suptitle(f'Sequential {config.benchmark} | {case_id}\nCumulative station history; invalid estimates leave gaps. Current outages do not erase old bearings.', fontsize=11)
+    fig.savefig(output / diagnostic_name, dpi=150)
+    plt.close(fig)
+    if diagnostic_name == "diagnostics.png":
+        handles = [Line2D([], [], marker="o", ls="", color=color, label=category.replace("_", " "))
+                   for category, color in NETWORK_COLORS.items()]
+        handles += [Line2D([], [], marker=marker, ls="", color=color, label=label) for marker, color, label in
+                    [("s", "#202b39", "station"), ("*", "#202b39", "true source"), ("x", "#b80052", "final valid estimate")]]
+        trajectory.legend(handles=handles, loc="outside lower center", ncol=4, fontsize=8)
+        trajectory.suptitle(f"Sequential {config.benchmark} | {case_id}\nPaths from matched initial positions (open circles); endpoint colors show final connectivity.", fontsize=11)
+        trajectory.savefig(output / "trajectory.png", dpi=150)
+    plt.close(trajectory)
+
+
+def plot_sequential_metrics(config, episodes, summaries, output):
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7), layout="constrained")
+    labels = [row["controller"].replace("_", " ") for row in summaries["overall"]]
+    for i, row in enumerate(summaries["overall"]):
+        color = COLORS["polygon"] if i == 0 else COLORS["random"]
+        low, high = row["quality_ci95"]
+        axes[0, 0].bar(i, row["mean_quality"], color=color)
+        axes[0, 0].plot([i, i], [low, high], color="#202b39", lw=2)
+        axes[0, 1].bar(i-.16, row["terminal_connectivity_pct"], width=.3, color=color, label=labels[i])
+        axes[0, 1].bar(i+.16, row["continuous_connectivity_pct"], width=.3, color=color, hatch="///", alpha=.5)
+        values = np.sort([item["error_m"] for item in episodes if item["controller"] == row["controller"] and item["terminal_connected"] and item["estimate_valid"]])
+        if len(values):
+            axes[1, 0].plot(values, np.arange(1, len(values)+1)/len(values), color=color, label=labels[i])
+        axes[1, 1].bar(i, row["mean_swarm_travel_m"], color=color)
+    axes[0, 0].set(title="Final-error Q | all episodes, 95% scenario CIs", ylim=(0, 1), ylabel="Mean Q")
+    axes[0, 1].set(title="Solid: terminal | hatched: continuous", ylim=(0, 100), ylabel="Episodes [%]")
+    axes[1, 0].set(title="Final errors | terminal connected and valid", xlabel="Error [m]", ylabel="Empirical CDF", xlim=(0, None))
+    if axes[1, 0].get_legend_handles_labels()[0]:
+        axes[1, 0].legend(fontsize=8)
+    else:
+        axes[1, 0].text(.5, .5, "No terminal-connected valid episodes", ha="center", transform=axes[1, 0].transAxes)
+    axes[1, 1].set(title="Actual path length | all episodes", ylabel="Mean total swarm travel [m]")
+    for ax in (axes[0, 0], axes[0, 1], axes[1, 1]):
+        ax.set(xticks=range(2), xticklabels=labels)
+    fig.suptitle(f"Sequential {config.benchmark} | sequential-v1 | hold-still vs random movement", fontsize=12)
+    fig.savefig(output / "metrics.png", dpi=150)
+    plt.close(fig)
+
+
+def save_sequential_results(output, config, settings, episodes, steps, drones, drone_episodes, summaries):
+    output = Path(output)
+    existing = output / "metadata.json"
+    if existing.exists() and json.loads(existing.read_text()).get("experiment") != "sequential":
+        raise ValueError("Sequential results require a separate directory; existing benchmark is protected")
+    output.mkdir(parents=True, exist_ok=True)
+    configuration = dict(**asdict(config), **settings)
+    trace_case = episodes[0]["case_id"]
+    reconnection_case = next((row["case_id"] for row in episodes if row["terminal_connected"] and not row["continuously_connected"]), None)
+    if reconnection_case is None:
+        reconnection_case = next((row["case_id"] for row in episodes if row["drone_reconnection_events"] > 0), None)
+    metadata = dict(experiment="sequential", benchmark_version="sequential-v1", initial_sampling_version=config.benchmark_version,
+                    config=configuration, config_sha256=hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest(),
+                    versions=dict(python=platform.python_version(), numpy=np.__version__, matplotlib=matplotlib.__version__),
+                    duration_s=settings["movement_steps"] * settings["step_seconds"],
+                    max_displacement_m=settings["step_seconds"] * settings["max_speed"],
+                    reference_distance_m=config.reference_distance,
+                    controllers=list(CONTROLLERS), controller_information="Team size, displacement budget, independent RNG only; no truth, belief or graph inputs",
+                    sensing="t=0 plus each post-move step; same per-drone/per-step Gaussian noise across controllers",
+                    random_streams="PCG64 SeedSequence([seed, trial, purpose, step]); motion purpose=5000, noise=3000; t=0 uses original scenario noise stream 3",
+                    history="Cumulative delivered (acquisition position, bearing); immediate multihop delivery; retain old data through outages; no buffering or retrospective upload",
+                    motion="Independent uniform-area displacements within speed*dt disk; truncate at map walls; no connectivity rejection or formation constraint",
+                    connectivity="Terminal: all reachable at T. Continuous: all reachable at every snapshot 0..T; no claim about unsampled instants",
+                    outage_convention="Connected fraction uses T+1 snapshots. Outage seconds sum dt for unreachable left endpoints 0..T-1; final-only outage adds no observed interval. Events use adjacent snapshots; initial outage is not a disconnection event",
+                    quality="L/(L+final_error) iff terminal-connected and final estimate valid; else zero; every episode in denominator; not an RL reward",
+                    uncertainty="95% percentile bootstrap of paired base-scenario IDs, keeping all initial formations/N/ranges in each block",
+                    trace_case_id=trace_case, reconnection_case_id=reconnection_case,
+                    plot_selection="Trace: first case, before outcomes. Reconnection: first terminal-successful case with earlier outage, otherwise first observed reconnection; diagnostic only, no exclusions")
+    (output / "metadata.json").write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n")
+    (output / "summary.json").write_text(json.dumps(summaries, indent=2, allow_nan=False) + "\n")
+    for name, rows in [("episodes", episodes), ("steps", steps), ("drone_steps", drones), ("drone_episodes", drone_episodes),
+                       ("leaderboard", summaries["overall"]), ("by_setting", summaries["by_setting"])]:
+        write_csv(output / f"{name}.csv", rows)
+    plot_sequential_metrics(config, episodes, summaries, output)
+    plot_episode(config, trace_case, episodes, steps, drones, output)
+    if reconnection_case is not None and reconnection_case != trace_case:
+        plot_episode(config, reconnection_case, episodes, steps, drones, output, "reconnection.png")
+    else:
+        (output / "reconnection.png").unlink(missing_ok=True)
+    lines = [f"# Sequential {config.benchmark} — sequential-v1", "",
+             f'{len(episodes)} episodes; N={config.drone_counts}; T={settings["movement_steps"]}; dt={settings["step_seconds"]:g} s; duration={metadata["duration_s"]:g} s; vmax={settings["max_speed"]:g} m/s.', "",
+             "Terminal connectivity and continuous connectivity are separate. Earlier outages do not zero a terminal-successful episode's Q. Final-error statistics below use terminal-connected, valid episodes; quality uses every episode.", "",
+             "| Controller | Episodes | Mean Q [95% CI] | Terminal % | Continuous % | Final estimator failure % | Mean swarm travel m |",
+             "|---|---:|---:|---:|---:|---:|---:|"]
+    for row in summaries["overall"]:
+        low, high = row["quality_ci95"]
+        lines.append(f'| {row["controller"]} | {row["episodes"]} | {row["mean_quality"]:.4f} [{low:.4f}, {high:.4f}] | '
+                     f'{row["terminal_connectivity_pct"]:.2f} | {row["continuous_connectivity_pct"]:.2f} | {row["estimator_failure_pct"]:.2f} | {row["mean_swarm_travel_m"]:.2f} |')
+    lines += ["", "| Controller | Accuracy n | Mean error m | Median m | RMSE m | Swarm-connected snapshot % | Mean swarm outage s | Drone disconnect/reconnect events |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for row in summaries["overall"]:
+        lines.append(f'| {row["controller"]} | {row["accuracy_episodes"]} | {format_number(row["mean_error_m"])} | {format_number(row["median_error_m"])} | {format_number(row["rmse_m"])} | '
+                     f'{100*row["mean_connected_step_fraction"]:.2f} | {row["mean_swarm_outage_s"]:.2f} | {row["drone_disconnection_events"]} / {row["drone_reconnection_events"]} |')
+    difference = summaries["paired_quality_difference"]
+    lines += ["", f'Paired mean Q(random − hold) = {difference["mean"]:.5f}; exploratory 95% CI {difference["ci95"]}.', "",
+              metadata["outage_convention"], "", "Raw logs retain all disconnected steps. Per-drone fractions, event counts, exposure and longest outage are in drone_episodes.csv. No early termination or backfilled measurements.", "",
+              "![Evaluation metrics](metrics.png)", "", "![Matched trajectories](trajectory.png)", "", "![Matched time diagnostics](diagnostics.png)"]
+    if reconnection_case is not None and reconnection_case != trace_case:
+        lines += ["", "![Reconnection case, diagnostic selection only](reconnection.png)"]
+    elif reconnection_case is not None:
+        lines += ["", "The matched diagnostics already show the selected reconnection case."]
+    (output / "summary.md").write_text("\n".join(lines) + "\n")

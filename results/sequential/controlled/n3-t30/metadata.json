@@ -1,0 +1,66 @@
+{
+  "experiment": "sequential",
+  "benchmark_version": "sequential-v1",
+  "initial_sampling_version": "controlled-v1",
+  "config": {
+    "seeds": [
+      11,
+      29
+    ],
+    "trials_per_seed": 5,
+    "drone_counts": [
+      3
+    ],
+    "communication_ranges": [
+      200.0,
+      350.0
+    ],
+    "width": 1000.0,
+    "height": 1000.0,
+    "station": [
+      500.0,
+      100.0
+    ],
+    "rms_radius": 100.0,
+    "noise_std_deg": 2.0,
+    "max_condition": 1000000.0,
+    "bootstrap_samples": 2000,
+    "benchmark": "controlled",
+    "deployment_centre": [
+      500.0,
+      350.0
+    ],
+    "source_radius": 75.0,
+    "movement_steps": 30,
+    "step_seconds": 2.0,
+    "max_speed": 5.0,
+    "initial_formations": [
+      "polygon"
+    ]
+  },
+  "config_sha256": "80286673079613da47da470c601864c23fc272fcfe66b7702b559548fdae0274",
+  "versions": {
+    "python": "3.14.8",
+    "numpy": "2.5.4",
+    "matplotlib": "3.11.2"
+  },
+  "duration_s": 60.0,
+  "max_displacement_m": 10.0,
+  "reference_distance_m": 1414.213562373095,
+  "controllers": [
+    "hold_still",
+    "random_movement"
+  ],
+  "controller_information": "Team size, displacement budget, independent RNG only; no truth, belief or graph inputs",
+  "sensing": "t=0 plus each post-move step; same per-drone/per-step Gaussian noise across controllers",
+  "random_streams": "PCG64 SeedSequence([seed, trial, purpose, step]); motion purpose=5000, noise=3000; t=0 uses original scenario noise stream 3",
+  "history": "Cumulative delivered (acquisition position, bearing); immediate multihop delivery; retain old data through outages; no buffering or retrospective upload",
+  "motion": "Independent uniform-area displacements within speed*dt disk; truncate at map walls; no connectivity rejection or formation constraint",
+  "connectivity": "Terminal: all reachable at T. Continuous: all reachable at every snapshot 0..T; no claim about unsampled instants",
+  "outage_convention": "Connected fraction uses T+1 snapshots. Outage seconds sum dt for unreachable left endpoints 0..T-1; final-only outage adds no observed interval. Events use adjacent snapshots; initial outage is not a disconnection event",
+  "quality": "L/(L+final_error) iff terminal-connected and final estimate valid; else zero; every episode in denominator; not an RL reward",
+  "uncertainty": "95% percentile bootstrap of paired base-scenario IDs, keeping all initial formations/N/ranges in each block",
+  "trace_case_id": "controlled-s11-t0000-n3-r200-polygon",
+  "reconnection_case_id": "controlled-s11-t0000-n3-r200-polygon",
+  "plot_selection": "Trace: first case, before outcomes. Reconnection: first terminal-successful case with earlier outage, otherwise first observed reconnection; diagnostic only, no exclusions"
+}
